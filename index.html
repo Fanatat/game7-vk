@@ -122,17 +122,32 @@
   //
   // VK Storage: значение ключа до 4096 символов, ключ — [a-zA-Z0-9_-] до
   // 100 символов, пустое значение — ключа нет. Длинное значение режется на
-  // куски key__0..N-1, а в самом ключе — заголовок «#game7chunks:N». Запись
-  // копится и уходит раз в WriteDelay (лимит запросов ВК), при уходе со
-  // страницы — сразу. Каждый вызов моста — с таймаутом: молчащий мост не
-  // вешает игру.
+  // куски в одном из двух слотов: key__a0..aN-1 или key__b0..bN-1, а в
+  // самом ключе — заголовок «#game7chunks:<слот>:N:<хеш>». Новая версия
+  // пишется в слот, на который заголовок не указывает, и заголовок
+  // меняется только после всех её кусков: сбой посередине оставляет
+  // прошлую целую версию. Хеш (FNV-1a) не совпал — значения нет, адаптер
+  // возьмёт копию устройства. Старый заголовок «#game7chunks:N» (куски
+  // key__0..) читается.
+  //
+  // Запись копится и уходит раз в WriteDelay (лимит запросов ВК), при уходе
+  // со страницы — сразу. Ключи — по одному, в порядке последней записи
+  // (save раньше save_t); первый сбой останавливает пачку, ключ и всё за ним
+  // остаются в очереди до повтора с нарастающей паузой. Каждый вызов моста —
+  // с таймаутом: молчащий мост не вешает игру.
   (function () {
     var ChunkSize = 3000;
     var ChunkHeader = "#game7chunks:";
     var WriteDelay = 3000;
+    var RetryMax = 60000;
     var vk = (window.game7Vk = { available: false, storage: null, storageError: "", writeError: "" });
     var pending = {};
     var timer = 0;
+    var flushing = false;
+    var again = false;
+    var retry = WriteDelay;
+    // Страницу спрятали: запись игры (сейв по уходу) уходит сразу, без паузы.
+    var hidden = false;
 
     function withTimeout(promise, ms) {
       return Promise.race([
@@ -147,86 +162,159 @@
       return withTimeout(window.vkBridge.send(method, params || {}), ms || 8000);
     };
 
-    function chunkCount(value) {
-      return value && value.indexOf(ChunkHeader) === 0 ? parseInt(value.substring(ChunkHeader.length), 10) || 0 : 0;
+    function hash(text) {
+      var h = 0x811c9dc5;
+      for (var i = 0; i < text.length; i++) {
+        h ^= text.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+      }
+      return ("0000000" + h.toString(16)).slice(-8);
     }
 
-    // null — ключа нет или кусок потерян (адаптер возьмёт копию устройства).
+    // Заголовок кусков: { slot: "a"|"b"|"" (старый), count, hash } или null.
+    function header(value) {
+      if (!value || value.indexOf(ChunkHeader) !== 0) return null;
+      var f = value.substring(ChunkHeader.length).split(":");
+      if (f.length === 1) return { slot: "", count: parseInt(f[0], 10) || 0, hash: "" };
+      return { slot: f[0], count: parseInt(f[1], 10) || 0, hash: f[2] || "" };
+    }
+
+    // null — ключа нет, кусок потерян или не сходится хеш (адаптер возьмёт
+    // копию устройства).
     vk.read = function (key) {
       var map = vk.storage;
       if (!map) return null;
       var value = map[key];
       if (!value) return null;
-      var count = chunkCount(value);
-      if (count === 0) return value;
+      var head = header(value);
+      if (!head) return value;
       var parts = [];
-      for (var i = 0; i < count; i++) {
-        var part = map[key + "__" + i];
+      for (var i = 0; i < head.count; i++) {
+        var part = map[key + "__" + head.slot + i];
         if (!part) {
-          console.warn("[game7] vk: storage кусок потерян", key, i);
+          console.warn("[game7] vk: storage кусок потерян", key, head.slot + i);
           return null;
         }
         parts.push(part);
       }
-      return parts.join("");
+      var text = parts.join("");
+      if (head.slot && hash(text) !== head.hash) {
+        console.warn("[game7] vk: storage куски не сходятся", key);
+        return null;
+      }
+      return text;
     };
 
-    // value null — удалить ключ.
+    // value null — удалить ключ. Ключ встаёт в конец очереди: порядок
+    // записи — порядок вызовов.
     vk.write = function (key, value) {
       if (!vk.storage) return;
+      delete pending[key];
       pending[key] = value;
-      if (!timer) timer = setTimeout(vk.flush, WriteDelay);
+      if (hidden) vk.flush();
+      else if (!timer && !flushing) timer = setTimeout(vk.flush, WriteDelay);
     };
+
+    function set(key, value) {
+      return vk.send("VKWebAppStorageSet", { key: key, value: value }, 5000).then(function () {
+        vk.storage[key] = value;
+      });
+    }
+
+    // Один ключ целиком: куски в свободный слот, потом заголовок, потом
+    // уборка кусков старого формата (её сбой не мешает).
+    function writeKey(key, value) {
+      var map = vk.storage;
+      var old = header(map[key]);
+      var steps = [];
+      if (value.length > ChunkSize) {
+        var slot = old && old.slot === "a" ? "b" : "a";
+        var count = 0;
+        for (var at = 0; at < value.length; at += ChunkSize, count++) {
+          steps.push([key + "__" + slot + count, value.substring(at, at + ChunkSize)]);
+        }
+        steps.push([key, ChunkHeader + slot + ":" + count + ":" + hash(value)]);
+      } else {
+        steps.push([key, value]);
+      }
+      var chain = steps.reduce(function (done, kv) {
+        return done.then(function () { return set(kv[0], kv[1]); });
+      }, Promise.resolve());
+      if (!old || old.slot) return chain;
+      return chain.then(function () {
+        var tidy = Promise.resolve();
+        for (var i = 0; i < old.count; i++) {
+          (function (part) {
+            tidy = tidy.then(function () { return set(part, "").catch(function () {}); });
+          })(key + "__" + i);
+        }
+        return tidy;
+      });
+    }
 
     vk.flush = function () {
       if (timer) clearTimeout(timer);
       timer = 0;
-      var map = vk.storage;
-      if (!map) return;
-      var sets = [];
-      Object.keys(pending).forEach(function (key) {
-        var value = pending[key] || "";
-        var old = chunkCount(map[key]);
-        var parts = [];
-        for (var at = 0; at < value.length; at += ChunkSize) parts.push(value.substring(at, at + ChunkSize));
-        if (parts.length > 1) {
-          parts.forEach(function (part, i) { sets.push([key + "__" + i, part]); });
-          sets.push([key, ChunkHeader + parts.length]);
-        } else {
-          sets.push([key, value]);
-        }
-        // Куски прошлой, более длинной записи стираются после заголовка.
-        for (var i = parts.length > 1 ? parts.length : 0; i < old; i++) sets.push([key + "__" + i, ""]);
-      });
-      pending = {};
-      // По порядку: заголовок уходит после своих кусков.
-      sets.reduce(function (chain, kv) {
-        map[kv[0]] = kv[1];
+      if (!vk.storage) return;
+      if (flushing) {
+        again = true;
+        return;
+      }
+      var batch = Object.keys(pending).map(function (key) { return [key, pending[key]]; });
+      if (!batch.length) return;
+      flushing = true;
+      again = false;
+      var failed = false;
+      batch.reduce(function (chain, kv) {
         return chain.then(function () {
-          return vk.send("VKWebAppStorageSet", { key: kv[0], value: kv[1] }, 5000).catch(function (e) {
+          if (failed) return;
+          return writeKey(kv[0], kv[1] || "").then(function () {
+            if (pending[kv[0]] === kv[1]) delete pending[kv[0]];
+          }, function (e) {
+            failed = true;
             vk.writeError = String((e && (e.error_data && e.error_data.error_reason)) || (e && e.message) || e);
             console.warn("[game7] vk: storage запись не прошла", kv[0], vk.writeError);
           });
         });
-      }, Promise.resolve());
+      }, Promise.resolve()).then(function () {
+        flushing = false;
+        if (failed) {
+          // Повтор с нарастающей паузой; уход со страницы пишет сразу.
+          timer = setTimeout(vk.flush, retry);
+          retry = Math.min(retry * 2, RetryMax);
+          return;
+        }
+        retry = WriteDelay;
+        if (again) vk.flush();
+        else if (Object.keys(pending).length && !timer) timer = setTimeout(vk.flush, WriteDelay);
+      });
     };
 
+    function hide() {
+      hidden = true;
+      vk.flush();
+    }
+
     document.addEventListener("visibilitychange", function () {
-      if (document.visibilityState === "hidden") vk.flush();
+      if (document.visibilityState === "hidden") hide();
+      else hidden = false;
     });
-    window.addEventListener("pagehide", function () { vk.flush(); });
+    window.addEventListener("pagehide", hide);
 
     // Мини-приложение свернули или закрыли «Выйти»: приложение ВК держит
     // страницу живой и видимой, сигнал — только событие моста. Звук спит
-    // (game7PageAudio — шаблон), сейв пишется сразу.
+    // (game7PageAudio — шаблон), сейв пишется сразу, бой — на паузу.
     if (window.vkBridge && window.vkBridge.subscribe) {
       window.vkBridge.subscribe(function (e) {
         var type = e && e.detail && e.detail.type;
         var audio = window.game7PageAudio;
         if (type === "VKWebAppViewHide") {
-          vk.flush();
+          hide();
           if (audio) audio.hide("vk");
+          // Игре — как уход со страницы (Game7_WatchPageHide): сейв, пауза боя.
+          window.dispatchEvent(new Event("game7-hide"));
         } else if (type === "VKWebAppViewRestore") {
+          hidden = false;
           if (audio) audio.show("vk");
         }
       });
@@ -359,16 +447,16 @@
       canvas.addEventListener("contextmenu", function (e) { e.preventDefault(); });
 
       var buildUrl = "Build";
-      var loaderUrl = buildUrl + "/vk-20261009-174609.loader.js";
+      var loaderUrl = buildUrl + "/vk-20261009-205502.loader.js";
       var config = {
         arguments: [],
-        dataUrl: buildUrl + "/vk-20261009-174609.data.unityweb",
-        frameworkUrl: buildUrl + "/vk-20261009-174609.framework.js.unityweb",
-        codeUrl: buildUrl + "/vk-20261009-174609.wasm.unityweb",
+        dataUrl: buildUrl + "/vk-20261009-205502.data.unityweb",
+        frameworkUrl: buildUrl + "/vk-20261009-205502.framework.js.unityweb",
+        codeUrl: buildUrl + "/vk-20261009-205502.wasm.unityweb",
         streamingAssetsUrl: "StreamingAssets",
         companyName: "DefaultCompany",
         productName: "unity",
-        productVersion: "vk-20261009-174609",
+        productVersion: "vk-20261009-205502",
         showBanner: unityShowBanner,
         // Экраны с плотностью 3 рисовали бы в 9 раз больше пикселей, чем
         // с плотностью 1: потолок 2 держит 60 FPS на среднем телефоне.
