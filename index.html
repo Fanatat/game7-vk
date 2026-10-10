@@ -120,15 +120,20 @@
   // createUnityInstance; промис не отклоняется: нет моста, нет параметров
   // запуска (страница не в ВК) или мост молчит — игра идёт как dev-билд.
   //
-  // VK Storage: значение ключа до 4096 символов, ключ — [a-zA-Z0-9_-] до
-  // 100 символов, пустое значение — ключа нет. Длинное значение режется на
-  // куски в одном из двух слотов: key__a0..aN-1 или key__b0..bN-1, а в
-  // самом ключе — заголовок «#game7chunks:<слот>:N:<хеш>». Новая версия
+  // VK Storage: ключ — [a-zA-Z0-9_-] до 100 символов, пустое значение —
+  // ключа нет. Значения ВК хранит «только первые 4096 символов, для
+  // сериализованной строки — 2236» (dev.vk.com, VKWebAppStorageSet), лишнее
+  // молча отрезает; сейв — JSON, поэтому кусок — до ChunkSize символов, а
+  // не-ASCII символ считается за 6 (в JSON он может стать \uXXXX). Длинное
+  // значение режется на куски в одном из двух слотов: key__a0..aN-1 или
+  // key__b0..bN-1, а в самом ключе — заголовок «#game7chunks:<слот>:N:<хеш>». Новая версия
   // пишется в слот, на который заголовок не указывает, и заголовок
   // меняется только после всех её кусков: сбой посередине оставляет
   // прошлую целую версию. Хеш (FNV-1a) не совпал — значения нет, адаптер
   // возьмёт копию устройства. Старый заголовок «#game7chunks:N» (куски
-  // key__0..) читается.
+  // key__0..) читается, куски прошлых билдов по 3000 — тоже (ВК мог их
+  // обрезать: хеш не сойдётся, и адаптер возьмёт копию устройства, а
+  // следующая запись ляжет новыми кусками).
   //
   // Запись копится и уходит раз в WriteDelay (лимит запросов ВК), при уходе
   // со страницы — сразу. Ключи — по одному, в порядке последней записи
@@ -136,7 +141,7 @@
   // остаются в очереди до повтора с нарастающей паузой. Каждый вызов моста —
   // с таймаутом: молчащий мост не вешает игру.
   (function () {
-    var ChunkSize = 3000;
+    var ChunkSize = 2000;
     var ChunkHeader = "#game7chunks:";
     var WriteDelay = 3000;
     var RetryMax = 60000;
@@ -169,6 +174,26 @@
         h = Math.imul(h, 0x01000193) >>> 0;
       }
       return ("0000000" + h.toString(16)).slice(-8);
+    }
+
+    // Куски не длиннее ChunkSize по весу: ASCII — 1, прочее — 6. Суррогатная
+    // пара (эмодзи) не разрывается.
+    function pieces(value) {
+      var out = [];
+      var start = 0;
+      var weight = 0;
+      for (var i = 0; i < value.length; i++) {
+        var code = value.charCodeAt(i);
+        var w = code < 128 ? 1 : 6;
+        if (weight + w > ChunkSize && i > start && (code < 0xdc00 || code > 0xdfff)) {
+          out.push(value.substring(start, i));
+          start = i;
+          weight = 0;
+        }
+        weight += w;
+      }
+      out.push(value.substring(start));
+      return out;
     }
 
     // Заголовок кусков: { slot: "a"|"b"|"" (старый), count, hash } или null.
@@ -227,13 +252,11 @@
       var map = vk.storage;
       var old = header(map[key]);
       var steps = [];
-      if (value.length > ChunkSize) {
+      var parts = pieces(value);
+      if (parts.length > 1) {
         var slot = old && old.slot === "a" ? "b" : "a";
-        var count = 0;
-        for (var at = 0; at < value.length; at += ChunkSize, count++) {
-          steps.push([key + "__" + slot + count, value.substring(at, at + ChunkSize)]);
-        }
-        steps.push([key, ChunkHeader + slot + ":" + count + ":" + hash(value)]);
+        for (var n = 0; n < parts.length; n++) steps.push([key + "__" + slot + n, parts[n]]);
+        steps.push([key, ChunkHeader + slot + ":" + parts.length + ":" + hash(value)]);
       } else {
         steps.push([key, value]);
       }
@@ -447,16 +470,16 @@
       canvas.addEventListener("contextmenu", function (e) { e.preventDefault(); });
 
       var buildUrl = "Build";
-      var loaderUrl = buildUrl + "/vk-20261009-221143.loader.js";
+      var loaderUrl = buildUrl + "/vk-20261010-063001.loader.js";
       var config = {
         arguments: [],
-        dataUrl: buildUrl + "/vk-20261009-221143.data.unityweb",
-        frameworkUrl: buildUrl + "/vk-20261009-221143.framework.js.unityweb",
-        codeUrl: buildUrl + "/vk-20261009-221143.wasm.unityweb",
+        dataUrl: buildUrl + "/vk-20261010-063001.data.unityweb",
+        frameworkUrl: buildUrl + "/vk-20261010-063001.framework.js.unityweb",
+        codeUrl: buildUrl + "/vk-20261010-063001.wasm.unityweb",
         streamingAssetsUrl: "StreamingAssets",
         companyName: "DefaultCompany",
         productName: "unity",
-        productVersion: "vk-20261009-221143",
+        productVersion: "vk-20261010-063001",
         showBanner: unityShowBanner,
         // Экраны с плотностью 3 рисовали бы в 9 раз больше пикселей, чем
         // с плотностью 1: потолок 2 держит 60 FPS на среднем телефоне.
