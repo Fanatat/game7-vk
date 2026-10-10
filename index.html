@@ -6,8 +6,8 @@
   кнопки fullscreen, подвала и логотипов нет, Esc не перехватывается.
   Названий площадок и внешних ссылок на странице нет; в билде под
   площадку BuildScript подставляет её скрипты на место platform-head
-  (tools/platform/), и страница ждёт window.game7PlatformReady, если
-  скрипт его создал. Заголовок вкладки — название игры из game.json в
+  (tools/platform/), и движок стартует после window.game7PlatformReady,
+  если скрипт его создал (файлы билда качаются сразу, не дожидаясь). Заголовок вкладки — название игры из game.json в
   корне репозитория: BuildScript подставляет его на место game-title.
   На место metrica-head BuildScript ставит счётчик Яндекс Метрики
   (tools/platform/metrica_head.html), если он включён для цели сборки;
@@ -447,20 +447,37 @@
       canvas.addEventListener("contextmenu", function (e) { e.preventDefault(); });
 
       var buildUrl = "Build";
-      var loaderUrl = buildUrl + "/vk-20261009-211220.loader.js";
+      var loaderUrl = buildUrl + "/vk-20261009-221143.loader.js";
       var config = {
         arguments: [],
-        dataUrl: buildUrl + "/vk-20261009-211220.data.unityweb",
-        frameworkUrl: buildUrl + "/vk-20261009-211220.framework.js.unityweb",
-        codeUrl: buildUrl + "/vk-20261009-211220.wasm.unityweb",
+        dataUrl: buildUrl + "/vk-20261009-221143.data.unityweb",
+        frameworkUrl: buildUrl + "/vk-20261009-221143.framework.js.unityweb",
+        codeUrl: buildUrl + "/vk-20261009-221143.wasm.unityweb",
         streamingAssetsUrl: "StreamingAssets",
         companyName: "DefaultCompany",
         productName: "unity",
-        productVersion: "vk-20261009-211220",
+        productVersion: "vk-20261009-221143",
         showBanner: unityShowBanner,
         // Экраны с плотностью 3 рисовали бы в 9 раз больше пикселей, чем
         // с плотностью 1: потолок 2 держит 60 FPS на среднем телефоне.
         devicePixelRatio: Math.min(window.devicePixelRatio || 1, 2),
+        // Имена файлов Build/ уникальны для каждой сборки (штамп в имени,
+        // tools/unity_build_webgl.sh), поэтому data, wasm и framework берутся
+        // из кэша Unity (Cache Storage) без условного запроса к серверу. По
+        // умолчанию loader перепроверяет data (304) и не кэширует wasm и
+        // framework вовсе: повторный заход качал 12.6 МБ wasm заново, если
+        // WebView вытеснил его из HTTP-кэша. Записи прошлых сборок loader
+        // стирает сам (другая productVersion = имя билда).
+        // Только эти три файла: через ту же функцию идёт каждый GET
+        // UnityWebRequest (framework: Module.cacheControl(url)). "immutable"
+        // для всех отдал бы из кэша старый ответ /v1/purchases?after=N
+        // (купленные монеты не выдаются, а на общем телефоне — чужой заказ:
+        // ключ кэша — только адрес) и застывшие рекорды. Остальное — как у
+        // Unity по умолчанию: "no-store".
+        cacheControl: function (url) {
+          return url === config.dataUrl || url === config.codeUrl || url === config.frameworkUrl
+            ? "immutable" : "no-store";
+        },
       };
 
       var loadingBar = document.querySelector("#unity-loading-bar");
@@ -472,15 +489,21 @@
       script.onload = function () {
         // Скрипт площадки (SDK) успевает подготовиться до старта игры: язык,
         // звук и сейв нужны ей с первого кадра. Промис не отклоняется.
+        // Файлы билда качаются сразу, параллельно с SDK (мост ВК — три
+        // запроса, до 4–5 с каждый), а движок ждёт площадку: зависимость
+        // запуска Emscripten держит main() до готовности промиса.
         var platformReady = window.game7PlatformReady || Promise.resolve();
-        platformReady.then(function () {
-          return createUnityInstance(canvas, config, function (progress) {
-            progressFull.style.width = 100 * progress + "%";
-            if (!loadHalf && progress >= 0.5) {
-              loadHalf = true;
-              ymGoal("load_50", { load_sec: Math.round((Date.now() - loadStart) / 100) / 10 });
-            }
-          });
+        config.preRun = [function (module) {
+          module.addRunDependency("game7Platform");
+          var release = function () { module.removeRunDependency("game7Platform"); };
+          platformReady.then(release, release);
+        }];
+        createUnityInstance(canvas, config, function (progress) {
+          progressFull.style.width = 100 * progress + "%";
+          if (!loadHalf && progress >= 0.5) {
+            loadHalf = true;
+            ymGoal("load_50", { load_sec: Math.round((Date.now() - loadStart) / 100) / 10 });
+          }
         }).then(function (instance) {
           window.unityInstance = instance; // знак для smoke и playtest: игра запустилась
           loadingBar.style.display = "none";
